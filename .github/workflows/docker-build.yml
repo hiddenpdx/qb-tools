@@ -1,0 +1,60 @@
+name: Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+        description: The dist plan JSON
+
+jobs:
+  docker-build:
+    if: ${{ fromJson(inputs.plan).announcement_tag != '' && !fromJson(inputs.plan).announcement_is_prerelease }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            artifact_name: docker-binaries-amd64
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact_name: docker-binaries-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      - name: Build Linux binaries
+        run: cargo zigbuild --profile dist --locked --target ${{ matrix.target }} --bins
+
+      - name: Prepare Docker artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          for binary in qb-autoremove qb-move-after-days qb-move-on-low-space; do
+            install -m 755 "target/${{ matrix.target }}/dist/${binary}" "artifacts/${binary}"
+          done
+
+      - name: Upload Docker artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/*
+          if-no-files-found: error
