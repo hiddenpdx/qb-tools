@@ -149,7 +149,7 @@ pub fn run_move_after_days(
     log_dir: Option<&Path>,
 ) -> Result<()> {
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard = setup_logging(log_dir, "qb-move-after-days.log", logging_mode)?;
+    let _log_guard = setup_logging(log_dir, "qb-move-after-days.log", logging_mode, true)?;
 
     let config = load_config(config_path)?;
     let rules = compile_rules(config.rules)?;
@@ -170,7 +170,7 @@ pub fn run_move_after_days_daemon(
     );
 
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard = setup_logging(log_dir, "qb-move-after-days.log", logging_mode)?;
+    let _log_guard = setup_logging(log_dir, "qb-move-after-days.log", logging_mode, false)?;
 
     let config = load_config(config_path)?;
     let rules = compile_rules(config.rules)?;
@@ -369,7 +369,7 @@ pub fn run_move_on_low_space(
     log_dir: Option<&Path>,
 ) -> Result<()> {
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard = setup_logging(log_dir, "qb-move-on-low-space.log", logging_mode)?;
+    let _log_guard = setup_logging(log_dir, "qb-move-on-low-space.log", logging_mode, true)?;
 
     let config = load_config(config_path)?;
     let rules = compile_rules(config.rules)?;
@@ -392,7 +392,7 @@ pub fn run_move_on_low_space_daemon(
     );
 
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard = setup_logging(log_dir, "qb-move-on-low-space.log", logging_mode)?;
+    let _log_guard = setup_logging(log_dir, "qb-move-on-low-space.log", logging_mode, false)?;
 
     let config = load_config(config_path)?;
     let rules = compile_rules(config.rules)?;
@@ -778,8 +778,9 @@ fn setup_logging(
     log_dir: Option<&Path>,
     log_file_name: &str,
     mode: LoggingMode,
+    console_ansi: bool,
 ) -> Result<Option<WorkerGuard>> {
-    setup_logging_with_level(log_dir, log_file_name, false, mode)
+    setup_logging_with_level(log_dir, log_file_name, false, mode, console_ansi)
 }
 
 fn setup_logging_with_level(
@@ -787,6 +788,7 @@ fn setup_logging_with_level(
     log_file_name: &str,
     debug: bool,
     mode: LoggingMode,
+    console_ansi: bool,
 ) -> Result<Option<WorkerGuard>> {
     let level = if debug {
         LevelFilter::DEBUG
@@ -794,6 +796,7 @@ fn setup_logging_with_level(
         LevelFilter::INFO
     };
     let console_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(console_ansi)
         .with_target(false)
         .with_writer(std::io::stdout)
         .with_filter(level);

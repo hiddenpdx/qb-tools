@@ -30,8 +30,13 @@ pub fn run_autoremove(
     debug_enabled: bool,
 ) -> Result<()> {
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard =
-        setup_logging_with_level(log_dir, "qb-autoremove.log", debug_enabled, logging_mode)?;
+    let _log_guard = setup_logging_with_level(
+        log_dir,
+        "qb-autoremove.log",
+        debug_enabled,
+        logging_mode,
+        true,
+    )?;
 
     let config = load_config(config_path)?;
     info!(
@@ -58,8 +63,13 @@ pub fn run_autoremove_daemon(
     );
 
     let logging_mode = load_logging_mode(config_path)?;
-    let _log_guard =
-        setup_logging_with_level(log_dir, "qb-autoremove.log", debug_enabled, logging_mode)?;
+    let _log_guard = setup_logging_with_level(
+        log_dir,
+        "qb-autoremove.log",
+        debug_enabled,
+        logging_mode,
+        false,
+    )?;
 
     let config = load_config(config_path)?;
     validate_selected_task(&config, selected_task)?;
