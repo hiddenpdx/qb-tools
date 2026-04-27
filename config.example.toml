@@ -1,0 +1,43 @@
+[client]
+host = "http://127.0.0.1:8080"
+username = "admin"
+password = "secret"
+
+[logging]
+mode = "rotating"
+
+[[rules]]
+source_path = "/Volumes/SSD/Movies"
+target_path = "/Volumes/HDD/Movies"
+min_days_since_completion = 14
+min_free_space_percent = 12.5
+
+[[rules]]
+source_path = "/Volumes/SSD/TV"
+target_path = "/Volumes/HDD/TV"
+min_days_since_completion = 7
+min_free_space_percent = 15.0
+
+[[tasks]]
+name = "ipt_cleanup"
+delete_data = true
+
+[[tasks.strategies]]
+name = "ratio_or_seedtime"
+categories = "IPT"
+remove = "seeding_time > 1209600 or ratio > 1"
+
+[[tasks.strategies]]
+name = "older_inactive"
+all_categories = true
+excluded_categories = ["Keep"]
+last_activity = "Never"
+
+[[tasks]]
+name = "recover_space"
+delete_data = false
+
+[[tasks.strategies]]
+name = "big_torrents_first"
+all_categories = true
+free_space = { min = 10.0, path = "/Volumes/SSD", action = "remove-big-seeds" }

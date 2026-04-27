@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!.dockerignore
+!docker-entrypoint.sh
+!artifacts/
+!artifacts/**
