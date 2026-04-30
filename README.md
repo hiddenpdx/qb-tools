@@ -18,6 +18,7 @@ This crate now builds three binaries:
 - Optional per-rule low-space thresholds
 - Separate autoremove tasks and strategies that delete torrents through qBittorrent
 - Autoremove-style filters, keyword conditions, and boolean `remove` expressions
+- Content-path-aware cross-seed handling for move and autoremove flows
 - Dry-run mode
 - Console logging on every run
 - Optional file logs, with shared rotating or single-file mode in config and `--log <folder>` choosing the directory
@@ -153,6 +154,22 @@ The relative path under the source root is preserved when moving:
 - `/Volumes/SSD/Movies` -> `/Volumes/HDD/Movies`
 - `/Volumes/SSD/TV/Show` -> `/Volumes/HDD/TV/Show`
 
+## Cross-Seed Handling
+
+These tools treat torrents that share the same qBittorrent `content_path` as one cross-seeded group.
+
+- `qb-move-after-days` moves every torrent in the group to the same destination
+- `qb-move-on-low-space` counts the group once for reclaimable size and queues every torrent in the group to the same destination
+- `qb-autoremove` expands a selected torrent into the full `content_path` group before deleting it
+- If `content_path` is empty or unavailable, the torrent is treated as standalone
+
+For `qb-autoremove`, `create_time` is group-aware:
+
+- `create_time` conditions use the earliest `addition_date` in the cross-seeded group
+- `remove` expressions that reference `create_time` use that same earliest timestamp
+- `remove-old-seeds` and `remove-new-seeds` sort by the earliest group timestamp
+- Other metrics such as ratio, seeding time, downloading time, size, activity, speeds, and peers remain per-torrent
+
 ## Usage
 
 `qb-move-after-days` uses `min_days_since_completion`.
@@ -268,6 +285,7 @@ target/release/qb-autoremove --view
 
 - Each `[[tasks]]` entry has a required `name` and optional `delete_data = true`
 - Each `[[tasks.strategies]]` entry has a required `name`
+- Strategy filters are evaluated per torrent before any cross-seed expansion
 - Strategy filters support:
   - `all_categories`, `categories`, `excluded_categories`
   - `all_trackers`, `trackers`, `excluded_trackers`
@@ -285,6 +303,8 @@ target/release/qb-autoremove --view
 - `remove = "..."` supports `and`, `or`, `(`, `)`, `<`, `>`, and `=`
 - `and` and `or` have the same precedence and are left-associative, matching upstream `autoremove-torrents`
 - For qBittorrent, `remote_free_space.path` is accepted for compatibility but ignored; qBittorrent reports one global free-space value
+- After a torrent passes a strategy's remove conditions, `qb-autoremove` adds every torrent in the same `content_path` group to the delete set
+- Cross-seeded siblings are deduplicated across strategies, so the same torrent is only deleted once
 
 ## Logging Config
 
@@ -304,7 +324,9 @@ target/release/qb-autoremove --view
 - The binary checks free space on the filesystem that contains `source_path`
 - If free space is below the configured threshold, it finds completed qBittorrent torrents for that rule
 - It sorts them by qBittorrent `completion_on`, oldest first
-- It queues enough torrents to cover the current free-space deficit based on torrent size
+- It treats torrents that share the same `content_path` as one group and counts that group once for reclaimable size
+- It queues enough torrent groups to cover the current free-space deficit based on group size
+- When a group is selected, it queues every torrent in that group to the same destination
 - It waits for those moves to finish, checks free space again, and repeats if more space is still needed
 - If `min_free_space_percent` is omitted for a rule, `qb-move-on-low-space` ignores that rule
 
@@ -321,6 +343,19 @@ target/release/qb-autoremove --view
   - torrents that had `auto_tmm` disabled
   - move requests and failures
   - a final summary
+
+`qb-autoremove` also logs cross-seed details:
+
+- selected primaries log `content_path`, `effective_create_time`, and `cross_seeds_found`
+- dry-run, delete, and delete-failure lines log `group_primary`, `group_primary_hash`, and `cross_seeds_found`
+- each `strategy finished` line reports selected-scope cross-seed stats:
+  - `selected_primaries`
+  - `cross_seed_groups`
+  - `cross_seeds_found`
+  - `unique_candidates_added`
+- the final `autoremove task finished` line reports filtered-scope cross-seed presence:
+  - `cross_seed_groups` is the number of filtered `content_path` groups with at least one sibling
+  - `cross_seeds_found` is the total number of sibling torrents present across those filtered groups
 
 ## Automatic Torrent Management
 
