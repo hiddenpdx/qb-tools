@@ -1,6 +1,6 @@
 [package]
 name = "qb-tools"
-version = "0.1.1"
+version = "0.2.0"
 description = "qBittorrent move and autoremove tools"
 edition = "2024"
 homepage = "https://github.com/hiddenpdx/qb-tools"

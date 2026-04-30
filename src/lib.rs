@@ -85,6 +85,8 @@ struct TorrentInfo {
     progress: f64,
     completion_on: i64,
     save_path: String,
+    #[serde(default)]
+    content_path: String,
     size: u64,
     #[serde(default)]
     auto_tmm: bool,
@@ -116,10 +118,17 @@ struct LowSpaceSummary {
 struct MoveCandidate {
     hash: String,
     name: String,
-    save_path: PathBuf,
     destination: PathBuf,
     completion_on: u64,
     size: u64,
+    members: Vec<GroupMoveMember>,
+}
+
+#[derive(Debug, Clone)]
+struct GroupMoveMember {
+    hash: String,
+    name: String,
+    save_path: PathBuf,
     auto_tmm: bool,
 }
 
@@ -134,6 +143,12 @@ struct QueuedMove {
 struct FilesystemUsage {
     total_bytes: u64,
     available_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ContentGroupKey {
+    Shared(PathBuf),
+    Standalone(String),
 }
 
 struct QbitClient {
@@ -203,145 +218,89 @@ fn run_move_after_days_once(
     let client = QbitClient::login(client_config)?;
 
     let now_epoch = current_unix_timestamp()?;
-    let mut summary = AgeSummary::default();
+    let torrents = client.list_torrents()?;
+    let (mut summary, planned_moves) = collect_age_move_candidates(&torrents, rules, now_epoch)?;
 
-    for torrent in client.list_torrents()? {
-        summary.checked += 1;
-
-        if torrent.progress < 1.0 {
-            summary.skipped += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                progress = torrent.progress,
-                "skipping incomplete torrent"
-            );
-            continue;
-        }
-
-        if torrent.completion_on <= 0 {
-            summary.skipped += 1;
-            warn!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                completion_on = torrent.completion_on,
-                "skipping torrent without a valid completion timestamp"
-            );
-            continue;
-        }
-
-        if torrent.state == "moving" {
-            summary.skipped += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                "skipping torrent that is already moving"
-            );
-            continue;
-        }
-
-        let save_path = normalize_path(Path::new(&torrent.save_path));
-        let Some(rule) = match_rule(&rules, &save_path) else {
-            summary.skipped += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                save_path = %save_path.display(),
-                "skipping torrent because no rule matched its save path"
-            );
-            continue;
-        };
-
-        let age_seconds = now_epoch.saturating_sub(torrent.completion_on as u64);
-        let min_age_seconds = rule
-            .min_days_since_completion
-            .saturating_mul(SECONDS_PER_DAY);
-        if age_seconds < min_age_seconds {
-            summary.skipped += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                age_days = age_seconds / SECONDS_PER_DAY,
-                min_days_since_completion = rule.min_days_since_completion,
-                "skipping torrent because it is not old enough yet"
-            );
-            continue;
-        }
-
-        let destination = remap_save_path(&save_path, rule)?;
-        if destination == save_path {
-            summary.skipped += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                save_path = %save_path.display(),
-                target = %destination.display(),
-                "skipping torrent because it is already in the destination path"
-            );
-            continue;
-        }
-
-        summary.eligible += 1;
-
+    for candidate in &planned_moves {
         if dry_run {
-            summary.dry_run_matches += 1;
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                source = %save_path.display(),
-                target = %destination.display(),
-                rule_source = %rule.source_path.display(),
-                rule_target = %rule.target_path.display(),
-                "dry-run: would move torrent"
-            );
+            for member in &candidate.members {
+                if member.save_path == candidate.destination {
+                    continue;
+                }
+
+                summary.dry_run_matches += 1;
+                info!(
+                    torrent = %member.name,
+                    hash = %member.hash,
+                    group_primary = %candidate.name,
+                    group_primary_hash = %candidate.hash,
+                    source = %member.save_path.display(),
+                    target = %candidate.destination.display(),
+                    "dry-run: would move torrent"
+                );
+            }
             continue;
         }
 
-        if torrent.auto_tmm {
-            info!(
-                torrent = %torrent.name,
-                hash = %torrent.hash,
-                "disabling automatic torrent management before move"
-            );
-            if let Err(error) = client.set_auto_management(&torrent.hash, false) {
-                summary.failed += 1;
-                error!(
-                    torrent = %torrent.name,
-                    hash = %torrent.hash,
-                    error = %error,
-                    "failed to disable automatic torrent management"
-                );
+        for member in &candidate.members {
+            if member.save_path == candidate.destination {
                 continue;
             }
-        }
 
-        info!(
-            torrent = %torrent.name,
-            hash = %torrent.hash,
-            source = %save_path.display(),
-            target = %destination.display(),
-            "moving torrent"
-        );
-
-        match client.set_location(&torrent.hash, &destination) {
-            Ok(()) => {
-                summary.moved += 1;
+            if member.auto_tmm {
                 info!(
-                    torrent = %torrent.name,
-                    hash = %torrent.hash,
-                    target = %destination.display(),
-                    "move requested successfully"
+                    torrent = %member.name,
+                    hash = %member.hash,
+                    group_primary = %candidate.name,
+                    group_primary_hash = %candidate.hash,
+                    "disabling automatic torrent management before move"
                 );
+                if let Err(error) = client.set_auto_management(&member.hash, false) {
+                    summary.failed += 1;
+                    error!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        error = %error,
+                        "failed to disable automatic torrent management"
+                    );
+                    continue;
+                }
             }
-            Err(error) => {
-                summary.failed += 1;
-                error!(
-                    torrent = %torrent.name,
-                    hash = %torrent.hash,
-                    target = %destination.display(),
-                    error = %error,
-                    "failed to move torrent"
-                );
+
+            info!(
+                torrent = %member.name,
+                hash = %member.hash,
+                group_primary = %candidate.name,
+                group_primary_hash = %candidate.hash,
+                source = %member.save_path.display(),
+                target = %candidate.destination.display(),
+                "moving torrent"
+            );
+
+            match client.set_location(&member.hash, &candidate.destination) {
+                Ok(()) => {
+                    summary.moved += 1;
+                    info!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        group_primary = %candidate.name,
+                        group_primary_hash = %candidate.hash,
+                        target = %candidate.destination.display(),
+                        "move requested successfully"
+                    );
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    error!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        group_primary = %candidate.name,
+                        group_primary_hash = %candidate.hash,
+                        target = %candidate.destination.display(),
+                        error = %error,
+                        "failed to move torrent"
+                    );
+                }
             }
         }
     }
@@ -538,28 +497,47 @@ fn process_low_space_rule(
         }
 
         let batch_bytes = batch.iter().map(|candidate| candidate.size).sum::<u64>();
+        let planned_torrents = batch
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .members
+                    .iter()
+                    .filter(|member| member.save_path != candidate.destination)
+                    .count()
+            })
+            .sum::<usize>();
         summary.batches_planned += 1;
-        summary.torrents_planned += batch.len();
+        summary.torrents_planned += planned_torrents;
 
         info!(
             source = %rule.source_path.display(),
             deficit_bytes,
             batch_bytes,
-            torrents = batch.len(),
+            groups = batch.len(),
+            torrents = planned_torrents,
             "selected low-space move batch"
         );
 
         if dry_run {
             for candidate in &batch {
-                info!(
-                    torrent = %candidate.name,
-                    hash = %candidate.hash,
-                    completion_on = candidate.completion_on,
-                    size = candidate.size,
-                    source = %candidate.save_path.display(),
-                    target = %candidate.destination.display(),
-                    "dry-run: would queue torrent to recover free space"
-                );
+                for member in &candidate.members {
+                    if member.save_path == candidate.destination {
+                        continue;
+                    }
+
+                    info!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        group_primary = %candidate.name,
+                        group_primary_hash = %candidate.hash,
+                        completion_on = candidate.completion_on,
+                        size = candidate.size,
+                        source = %member.save_path.display(),
+                        target = %candidate.destination.display(),
+                        "dry-run: would queue torrent to recover free space"
+                    );
+                }
             }
 
             return Ok(triggered);
@@ -583,54 +561,65 @@ fn queue_low_space_batch(
     batch: &[MoveCandidate],
     summary: &mut LowSpaceSummary,
 ) -> Vec<QueuedMove> {
-    let mut queued = Vec::with_capacity(batch.len());
+    let capacity = batch.iter().map(|candidate| candidate.members.len()).sum();
+    let mut queued = Vec::with_capacity(capacity);
 
     for candidate in batch {
-        if candidate.auto_tmm {
-            info!(
-                torrent = %candidate.name,
-                hash = %candidate.hash,
-                "disabling automatic torrent management before low-space move"
-            );
-            if let Err(error) = client.set_auto_management(&candidate.hash, false) {
-                summary.failed += 1;
-                error!(
-                    torrent = %candidate.name,
-                    hash = %candidate.hash,
-                    error = %error,
-                    "failed to disable automatic torrent management before low-space move"
-                );
+        for member in &candidate.members {
+            if member.save_path == candidate.destination {
                 continue;
             }
-        }
 
-        info!(
-            torrent = %candidate.name,
-            hash = %candidate.hash,
-            size = candidate.size,
-            source = %candidate.save_path.display(),
-            target = %candidate.destination.display(),
-            "queueing torrent move for free-space recovery"
-        );
-
-        match client.set_location(&candidate.hash, &candidate.destination) {
-            Ok(()) => {
-                summary.torrents_queued += 1;
-                queued.push(QueuedMove {
-                    hash: candidate.hash.clone(),
-                    name: candidate.name.clone(),
-                    destination: candidate.destination.clone(),
-                });
-            }
-            Err(error) => {
-                summary.failed += 1;
-                error!(
-                    torrent = %candidate.name,
-                    hash = %candidate.hash,
-                    target = %candidate.destination.display(),
-                    error = %error,
-                    "failed to queue torrent move for free-space recovery"
+            if member.auto_tmm {
+                info!(
+                    torrent = %member.name,
+                    hash = %member.hash,
+                    group_primary = %candidate.name,
+                    group_primary_hash = %candidate.hash,
+                    "disabling automatic torrent management before low-space move"
                 );
+                if let Err(error) = client.set_auto_management(&member.hash, false) {
+                    summary.failed += 1;
+                    error!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        error = %error,
+                        "failed to disable automatic torrent management before low-space move"
+                    );
+                    continue;
+                }
+            }
+
+            info!(
+                torrent = %member.name,
+                hash = %member.hash,
+                group_primary = %candidate.name,
+                group_primary_hash = %candidate.hash,
+                size = candidate.size,
+                source = %member.save_path.display(),
+                target = %candidate.destination.display(),
+                "queueing torrent move for free-space recovery"
+            );
+
+            match client.set_location(&member.hash, &candidate.destination) {
+                Ok(()) => {
+                    summary.torrents_queued += 1;
+                    queued.push(QueuedMove {
+                        hash: member.hash.clone(),
+                        name: member.name.clone(),
+                        destination: candidate.destination.clone(),
+                    });
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    error!(
+                        torrent = %member.name,
+                        hash = %member.hash,
+                        target = %candidate.destination.display(),
+                        error = %error,
+                        "failed to queue torrent move for free-space recovery"
+                    );
+                }
             }
         }
     }
@@ -686,38 +675,64 @@ fn collect_low_space_candidates(
     current_rule: &Rule,
 ) -> Result<Vec<MoveCandidate>> {
     let mut candidates = Vec::new();
+    let grouped = group_by_content_path(
+        torrents,
+        |torrent| torrent.hash.as_str(),
+        |torrent| torrent.content_path.as_str(),
+    );
 
-    for torrent in torrents {
-        if torrent.progress < 1.0 || torrent.completion_on <= 0 || torrent.state == "moving" {
-            continue;
-        }
+    for group in grouped.values() {
+        let mut primary = group
+            .iter()
+            .copied()
+            .filter_map(|torrent| {
+                if torrent.progress < 1.0 || torrent.completion_on <= 0 || torrent.state == "moving"
+                {
+                    return None;
+                }
 
-        let save_path = normalize_path(Path::new(&torrent.save_path));
-        let Some(matched_rule) = match_rule(rules, &save_path) else {
+                let save_path = normalize_path(Path::new(&torrent.save_path));
+                let matched_rule = match_rule(rules, &save_path)?;
+                if matched_rule.index != current_rule.index {
+                    return None;
+                }
+
+                let destination = remap_save_path(&save_path, current_rule).ok()?;
+                if destination == save_path || torrent.size == 0 {
+                    return None;
+                }
+
+                Some((torrent, save_path, destination))
+            })
+            .collect::<Vec<_>>();
+
+        primary.sort_by_key(|(torrent, _, _)| torrent.completion_on);
+        let Some((primary, _save_path, destination)) = primary.into_iter().next() else {
             continue;
         };
 
-        if matched_rule.index != current_rule.index {
-            continue;
-        }
-
-        let destination = remap_save_path(&save_path, current_rule)?;
-        if destination == save_path {
-            continue;
-        }
-
-        if torrent.size == 0 {
-            continue;
-        }
+        let size = group
+            .iter()
+            .map(|torrent| torrent.size)
+            .max()
+            .unwrap_or(primary.size);
+        let members = group
+            .iter()
+            .map(|torrent| GroupMoveMember {
+                hash: torrent.hash.clone(),
+                name: torrent.name.clone(),
+                save_path: normalize_path(Path::new(&torrent.save_path)),
+                auto_tmm: torrent.auto_tmm,
+            })
+            .collect::<Vec<_>>();
 
         candidates.push(MoveCandidate {
-            hash: torrent.hash.clone(),
-            name: torrent.name.clone(),
-            save_path,
+            hash: primary.hash.clone(),
+            name: primary.name.clone(),
             destination,
-            completion_on: torrent.completion_on as u64,
-            size: torrent.size,
-            auto_tmm: torrent.auto_tmm,
+            completion_on: primary.completion_on as u64,
+            size,
+            members,
         });
     }
 
@@ -949,6 +964,41 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
+pub(crate) fn normalized_content_path(content_path: &str) -> Option<PathBuf> {
+    let trimmed = content_path.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(normalize_path(Path::new(trimmed)))
+    }
+}
+
+pub(crate) fn content_group_key(content_path: &str, fallback_hash: &str) -> ContentGroupKey {
+    match normalized_content_path(content_path) {
+        Some(path) => ContentGroupKey::Shared(path),
+        None => ContentGroupKey::Standalone(fallback_hash.to_string()),
+    }
+}
+
+pub(crate) fn group_by_content_path<'a, T, FHash, FContent>(
+    items: &'a [T],
+    hash_of: FHash,
+    content_path_of: FContent,
+) -> HashMap<ContentGroupKey, Vec<&'a T>>
+where
+    FHash: Fn(&T) -> &str,
+    FContent: Fn(&T) -> &str,
+{
+    let mut groups = HashMap::new();
+
+    for item in items {
+        let key = content_group_key(content_path_of(item), hash_of(item));
+        groups.entry(key).or_insert_with(Vec::new).push(item);
+    }
+
+    groups
+}
+
 fn match_rule<'a>(rules: &'a [Rule], save_path: &Path) -> Option<&'a Rule> {
     rules
         .iter()
@@ -979,6 +1029,135 @@ fn current_unix_timestamp() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?;
     Ok(now.as_secs())
+}
+
+fn collect_age_move_candidates(
+    torrents: &[TorrentInfo],
+    rules: &[Rule],
+    now_epoch: u64,
+) -> Result<(AgeSummary, Vec<MoveCandidate>)> {
+    let grouped = group_by_content_path(
+        torrents,
+        |torrent| torrent.hash.as_str(),
+        |torrent| torrent.content_path.as_str(),
+    );
+    let mut handled_groups = HashSet::new();
+    let mut summary = AgeSummary {
+        checked: torrents.len(),
+        ..AgeSummary::default()
+    };
+    let mut planned_moves = Vec::new();
+
+    for torrent in torrents {
+        let group_key = content_group_key(&torrent.content_path, &torrent.hash);
+        if handled_groups.contains(&group_key) {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                "skipping torrent because its cross-seed group is already planned"
+            );
+            continue;
+        }
+
+        if torrent.progress < 1.0 {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                progress = torrent.progress,
+                "skipping incomplete torrent"
+            );
+            continue;
+        }
+
+        if torrent.completion_on <= 0 {
+            summary.skipped += 1;
+            warn!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                completion_on = torrent.completion_on,
+                "skipping torrent without a valid completion timestamp"
+            );
+            continue;
+        }
+
+        if torrent.state == "moving" {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                "skipping torrent that is already moving"
+            );
+            continue;
+        }
+
+        let save_path = normalize_path(Path::new(&torrent.save_path));
+        let Some(rule) = match_rule(rules, &save_path) else {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                save_path = %save_path.display(),
+                "skipping torrent because no rule matched its save path"
+            );
+            continue;
+        };
+
+        let age_seconds = now_epoch.saturating_sub(torrent.completion_on as u64);
+        let min_age_seconds = rule
+            .min_days_since_completion
+            .saturating_mul(SECONDS_PER_DAY);
+        if age_seconds < min_age_seconds {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                age_days = age_seconds / SECONDS_PER_DAY,
+                min_days_since_completion = rule.min_days_since_completion,
+                "skipping torrent because it is not old enough yet"
+            );
+            continue;
+        }
+
+        let destination = remap_save_path(&save_path, rule)?;
+        if destination == save_path {
+            summary.skipped += 1;
+            info!(
+                torrent = %torrent.name,
+                hash = %torrent.hash,
+                save_path = %save_path.display(),
+                target = %destination.display(),
+                "skipping torrent because it is already in the destination path"
+            );
+            continue;
+        }
+
+        let members = grouped
+            .get(&group_key)
+            .into_iter()
+            .flatten()
+            .map(|member| GroupMoveMember {
+                hash: member.hash.clone(),
+                name: member.name.clone(),
+                save_path: normalize_path(Path::new(&member.save_path)),
+                auto_tmm: member.auto_tmm,
+            })
+            .collect::<Vec<_>>();
+
+        summary.eligible += 1;
+        handled_groups.insert(group_key);
+        planned_moves.push(MoveCandidate {
+            hash: torrent.hash.clone(),
+            name: torrent.name.clone(),
+            destination,
+            completion_on: torrent.completion_on as u64,
+            size: torrent.size,
+            members,
+        });
+    }
+
+    Ok((summary, planned_moves))
 }
 
 impl QbitClient {
@@ -1174,11 +1353,35 @@ mod tests {
         MoveCandidate {
             hash: format!("hash-{name}"),
             name: name.to_string(),
-            save_path: PathBuf::from("/Volumes/SSD"),
             destination: PathBuf::from("/Volumes/HDD"),
             completion_on,
             size,
+            members: vec![GroupMoveMember {
+                hash: format!("hash-{name}"),
+                name: name.to_string(),
+                save_path: PathBuf::from("/Volumes/SSD"),
+                auto_tmm: false,
+            }],
+        }
+    }
+
+    fn torrent_info(
+        name: &str,
+        save_path: &str,
+        content_path: &str,
+        completion_on: i64,
+        size: u64,
+    ) -> TorrentInfo {
+        TorrentInfo {
+            hash: format!("hash-{name}"),
+            name: name.to_string(),
+            progress: 1.0,
+            completion_on,
+            save_path: save_path.to_string(),
+            content_path: content_path.to_string(),
+            size,
             auto_tmm: false,
+            state: String::new(),
         }
     }
 
@@ -1220,6 +1423,43 @@ mod tests {
     }
 
     #[test]
+    fn group_by_content_path_normalizes_shared_paths_and_falls_back_to_hashes() {
+        let torrents = vec![
+            torrent_info(
+                "first",
+                "/Volumes/SSD/Show",
+                "/Volumes/SSD/Show/./",
+                10,
+                100,
+            ),
+            torrent_info("second", "/Volumes/SSD/Show", "/Volumes/SSD/Show", 20, 100),
+            torrent_info("standalone", "/Volumes/SSD/Other", "", 30, 100),
+        ];
+
+        let groups = group_by_content_path(
+            &torrents,
+            |torrent| torrent.hash.as_str(),
+            |torrent| torrent.content_path.as_str(),
+        );
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .get(&ContentGroupKey::Shared(PathBuf::from("/Volumes/SSD/Show")))
+                .expect("shared group exists")
+                .len(),
+            2
+        );
+        assert_eq!(
+            groups
+                .get(&ContentGroupKey::Standalone("hash-standalone".to_string()))
+                .expect("standalone group exists")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn does_not_match_paths_that_only_share_a_string_prefix() {
         let rules = vec![rule("/Volumes/SSD", "/Volumes/HDD", 14, None)];
 
@@ -1247,6 +1487,73 @@ mod tests {
 
         let selected = select_low_space_batch(&candidates, 1_000);
         assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn low_space_candidates_group_cross_seeded_torrents_by_content_path() {
+        let rule = rule("/Volumes/SSD", "/Volumes/HDD", 14, Some(10.0));
+        let rules = vec![rule.clone()];
+        let torrents = vec![
+            torrent_info(
+                "older",
+                "/Volumes/SSD/Movies/Shared",
+                "/Volumes/SSD/Movies/Shared",
+                10,
+                300,
+            ),
+            torrent_info(
+                "newer",
+                "/Volumes/SSD/Movies/Shared",
+                "/Volumes/SSD/Movies/Shared",
+                20,
+                300,
+            ),
+        ];
+
+        let candidates =
+            collect_low_space_candidates(&torrents, &rules, &rule).expect("candidates collect");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].hash, "hash-older");
+        assert_eq!(candidates[0].members.len(), 2);
+        assert_eq!(
+            candidates[0].destination,
+            PathBuf::from("/Volumes/HDD/Movies/Shared")
+        );
+        assert_eq!(candidates[0].size, 300);
+    }
+
+    #[test]
+    fn move_after_days_plans_cross_seed_siblings_together() {
+        let rules = vec![rule("/Volumes/SSD", "/Volumes/HDD", 1, None)];
+        let torrents = vec![
+            torrent_info(
+                "primary",
+                "/Volumes/SSD/Movies/Shared",
+                "/Volumes/SSD/Movies/Shared",
+                10,
+                300,
+            ),
+            torrent_info(
+                "sibling",
+                "/Volumes/SSD/Movies/Shared",
+                "/Volumes/SSD/Movies/Shared",
+                20,
+                300,
+            ),
+        ];
+
+        let (summary, planned) =
+            collect_age_move_candidates(&torrents, &rules, SECONDS_PER_DAY * 2)
+                .expect("moves collect");
+
+        assert_eq!(summary.eligible, 1);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(
+            planned[0].destination,
+            PathBuf::from("/Volumes/HDD/Movies/Shared")
+        );
+        assert_eq!(planned[0].members.len(), 2);
     }
 
     #[test]

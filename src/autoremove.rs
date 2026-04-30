@@ -14,8 +14,8 @@ use toml_edit::{DocumentMut, Item, Table, TableLike};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    ClientConfig, api_url, build_origin, current_unix_timestamp, filesystem_usage,
-    load_logging_mode, normalize_base_url, setup_logging_with_level,
+    ClientConfig, ContentGroupKey, api_url, build_origin, current_unix_timestamp, filesystem_usage,
+    group_by_content_path, load_logging_mode, normalize_base_url, setup_logging_with_level,
 };
 
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
@@ -321,6 +321,7 @@ enum TorrentStatus {
 struct Torrent {
     hash: String,
     name: String,
+    content_path: String,
     category: Vec<String>,
     tracker: Vec<String>,
     status: TorrentStatus,
@@ -330,6 +331,7 @@ struct Torrent {
     uploaded: i64,
     downloaded: i64,
     create_time: i64,
+    effective_create_time: i64,
     seeding_time: i64,
     downloading_time: i64,
     upload_speed: i64,
@@ -358,25 +360,75 @@ struct TaskSummary {
     torrents_seen: usize,
     candidates: usize,
     deleted: usize,
+    cross_seed_groups: usize,
+    cross_seeds_found: usize,
 }
 
 #[derive(Debug)]
 struct DeleteCandidate {
     torrent: Torrent,
     strategy: String,
+    group_primary: String,
+    group_primary_hash: String,
+    cross_seeds_found: usize,
 }
 
+#[derive(Debug, Default)]
+struct StrategySummary {
+    filtered: usize,
+    selected_primaries: usize,
+    cross_seed_groups: usize,
+    cross_seeds_found: usize,
+    unique_candidates_added: usize,
+}
+
+#[derive(Debug)]
+struct DeleteGroupStats {
+    group_key: ContentGroupKey,
+    cross_seeds_found: usize,
+    unique_candidates_added: usize,
+    unique_siblings_added: usize,
+}
+
+#[cfg(test)]
 fn record_delete_candidate(
     remove_by_hash: &mut HashMap<String, DeleteCandidate>,
     torrent: Torrent,
     strategy_name: &str,
-) {
-    remove_by_hash
-        .entry(torrent.hash.clone())
-        .or_insert_with(|| DeleteCandidate {
-            torrent,
-            strategy: strategy_name.to_string(),
-        });
+) -> bool {
+    let group_primary = torrent.name.clone();
+    let group_primary_hash = torrent.hash.clone();
+    record_delete_candidate_with_metadata(
+        remove_by_hash,
+        torrent,
+        strategy_name,
+        &group_primary,
+        &group_primary_hash,
+        0,
+    )
+}
+
+fn record_delete_candidate_with_metadata(
+    remove_by_hash: &mut HashMap<String, DeleteCandidate>,
+    torrent: Torrent,
+    strategy_name: &str,
+    group_primary: &str,
+    group_primary_hash: &str,
+    cross_seeds_found: usize,
+) -> bool {
+    match remove_by_hash.entry(torrent.hash.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(DeleteCandidate {
+                torrent,
+                strategy: strategy_name.to_string(),
+                group_primary: group_primary.to_string(),
+                group_primary_hash: group_primary_hash.to_string(),
+                cross_seeds_found,
+            });
+            true
+        }
+        std::collections::hash_map::Entry::Occupied(_) => false,
+    }
 }
 
 fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool) -> Result<()> {
@@ -392,20 +444,30 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
         free_space_on_disk = ?client_status.free_space_on_disk,
         "fetched qBittorrent client status"
     );
-    let torrents = client.list_torrents()?;
+    let mut torrents = client.list_torrents()?;
+    apply_effective_group_create_times(&mut torrents);
+    let (group_members_by_key, group_key_by_hash) = build_group_lookups(&torrents);
     let mut remove_by_hash = HashMap::new();
     let now = current_unix_timestamp_i64()?;
     let mut summary = TaskSummary {
         torrents_seen: torrents.len(),
         ..TaskSummary::default()
     };
+    let mut filtered_task_cross_seed_groups = HashSet::new();
 
     for strategy in &task.strategies {
         let filtered = apply_filters(&strategy.filters, &torrents);
+        let filtered_count = filtered.len();
+        extend_filtered_cross_seed_groups(
+            &filtered,
+            &group_members_by_key,
+            &group_key_by_hash,
+            &mut filtered_task_cross_seed_groups,
+        );
         info!(
             task = %task.name,
             strategy = %strategy.name,
-            filtered = filtered.len(),
+            filtered = filtered_count,
             conditions = strategy.conditions.len(),
             "running strategy"
         );
@@ -420,12 +482,46 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
             strategy_remove.extend(newly_removed);
         }
 
+        let mut strategy_summary = StrategySummary {
+            filtered: filtered_count,
+            selected_primaries: strategy_remove.len(),
+            ..StrategySummary::default()
+        };
+        let mut strategy_cross_seed_groups = HashSet::new();
+
         for torrent in strategy_remove {
-            record_delete_candidate(&mut remove_by_hash, torrent, &strategy.name);
+            let stats = record_delete_group_candidates(
+                &mut remove_by_hash,
+                &group_members_by_key,
+                &group_key_by_hash,
+                torrent,
+                &strategy.name,
+                &task.name,
+            );
+            strategy_summary.unique_candidates_added += stats.unique_candidates_added;
+            strategy_summary.cross_seeds_found += stats.unique_siblings_added;
+            if stats.cross_seeds_found > 0 {
+                strategy_cross_seed_groups.insert(stats.group_key.clone());
+            }
         }
+
+        strategy_summary.cross_seed_groups = strategy_cross_seed_groups.len();
+
+        info!(
+            task = %task.name,
+            strategy = %strategy.name,
+            filtered = strategy_summary.filtered,
+            selected_primaries = strategy_summary.selected_primaries,
+            cross_seed_groups = strategy_summary.cross_seed_groups,
+            cross_seeds_found = strategy_summary.cross_seeds_found,
+            unique_candidates_added = strategy_summary.unique_candidates_added,
+            "strategy finished"
+        );
     }
 
     summary.candidates = remove_by_hash.len();
+    (summary.cross_seed_groups, summary.cross_seeds_found) =
+        summarize_cross_seed_groups(&filtered_task_cross_seed_groups, &group_members_by_key);
 
     if dry_run {
         for candidate in remove_by_hash.values() {
@@ -434,6 +530,9 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
                 strategy = %candidate.strategy,
                 torrent = %candidate.torrent.name,
                 hash = %candidate.torrent.hash,
+                group_primary = %candidate.group_primary,
+                group_primary_hash = %candidate.group_primary_hash,
+                cross_seeds_found = candidate.cross_seeds_found,
                 delete_data = task.delete_data,
                 "dry-run: would delete torrent"
             );
@@ -449,6 +548,9 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
                         strategy = %candidate.strategy,
                         torrent = %candidate.torrent.name,
                         hash = %candidate.torrent.hash,
+                        group_primary = %candidate.group_primary,
+                        group_primary_hash = %candidate.group_primary_hash,
+                        cross_seeds_found = candidate.cross_seeds_found,
                         delete_data = task.delete_data,
                         "deleted torrent"
                     );
@@ -461,6 +563,9 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
                         strategy = %candidate.strategy,
                         torrent = %candidate.torrent.name,
                         hash = %candidate.torrent.hash,
+                        group_primary = %candidate.group_primary,
+                        group_primary_hash = %candidate.group_primary_hash,
+                        cross_seeds_found = candidate.cross_seeds_found,
                         delete_data = task.delete_data,
                         error = %error,
                         "failed to delete torrent"
@@ -476,11 +581,188 @@ fn run_task(client: &QbitAutoremoveClient, task: &AutoremoveTask, dry_run: bool)
         torrents_seen = summary.torrents_seen,
         candidates = summary.candidates,
         deleted = summary.deleted,
+        cross_seed_groups = summary.cross_seed_groups,
+        cross_seeds_found = summary.cross_seeds_found,
         delete_data = task.delete_data,
         "autoremove task finished"
     );
 
     Ok(())
+}
+
+fn apply_effective_group_create_times(torrents: &mut [Torrent]) {
+    let mut earliest_by_hash = HashMap::new();
+    {
+        let grouped = group_by_content_path(
+            torrents,
+            |torrent| torrent.hash.as_str(),
+            |torrent| torrent.content_path.as_str(),
+        );
+
+        for group in grouped.values() {
+            let earliest = group
+                .iter()
+                .map(|torrent| torrent.create_time)
+                .min()
+                .unwrap_or_default();
+
+            for torrent in group {
+                earliest_by_hash.insert(torrent.hash.clone(), earliest);
+            }
+        }
+    }
+
+    for torrent in torrents {
+        torrent.effective_create_time = earliest_by_hash
+            .get(&torrent.hash)
+            .copied()
+            .unwrap_or(torrent.create_time);
+    }
+}
+
+fn build_group_lookups(
+    torrents: &[Torrent],
+) -> (
+    HashMap<ContentGroupKey, Vec<Torrent>>,
+    HashMap<String, ContentGroupKey>,
+) {
+    let grouped = group_by_content_path(
+        torrents,
+        |torrent| torrent.hash.as_str(),
+        |torrent| torrent.content_path.as_str(),
+    );
+    let mut groups = HashMap::new();
+    let mut group_key_by_hash = HashMap::new();
+
+    for (key, members) in grouped {
+        let cloned_members = members.iter().map(|torrent| (*torrent).clone()).collect();
+        for torrent in &members {
+            group_key_by_hash.insert(torrent.hash.clone(), key.clone());
+        }
+        groups.insert(key, cloned_members);
+    }
+
+    (groups, group_key_by_hash)
+}
+
+fn extend_filtered_cross_seed_groups(
+    filtered: &[Torrent],
+    group_members_by_key: &HashMap<ContentGroupKey, Vec<Torrent>>,
+    group_key_by_hash: &HashMap<String, ContentGroupKey>,
+    filtered_cross_seed_groups: &mut HashSet<ContentGroupKey>,
+) {
+    for torrent in filtered {
+        let Some(group_key) = group_key_by_hash.get(&torrent.hash) else {
+            continue;
+        };
+        let Some(group_members) = group_members_by_key.get(group_key) else {
+            continue;
+        };
+        if group_members.len() > 1 {
+            filtered_cross_seed_groups.insert(group_key.clone());
+        }
+    }
+}
+
+fn summarize_cross_seed_groups(
+    cross_seed_groups: &HashSet<ContentGroupKey>,
+    group_members_by_key: &HashMap<ContentGroupKey, Vec<Torrent>>,
+) -> (usize, usize) {
+    let groups = cross_seed_groups.len();
+    let siblings = cross_seed_groups
+        .iter()
+        .map(|group_key| {
+            group_members_by_key
+                .get(group_key)
+                .map(|members| members.len().saturating_sub(1))
+                .unwrap_or(0)
+        })
+        .sum();
+
+    (groups, siblings)
+}
+
+fn record_delete_group_candidates(
+    remove_by_hash: &mut HashMap<String, DeleteCandidate>,
+    group_members_by_key: &HashMap<ContentGroupKey, Vec<Torrent>>,
+    group_key_by_hash: &HashMap<String, ContentGroupKey>,
+    primary: Torrent,
+    strategy_name: &str,
+    task_name: &str,
+) -> DeleteGroupStats {
+    let group_key = group_key_by_hash
+        .get(&primary.hash)
+        .cloned()
+        .unwrap_or_else(|| ContentGroupKey::Standalone(primary.hash.clone()));
+    let group_members = group_members_by_key.get(&group_key);
+    let cross_seeds_found = group_members
+        .map(|members| members.len().saturating_sub(1))
+        .unwrap_or(0);
+    let group_primary = primary.name.clone();
+    let group_primary_hash = primary.hash.clone();
+
+    info!(
+        task = %task_name,
+        strategy = %strategy_name,
+        torrent = %primary.name,
+        hash = %primary.hash,
+        group_primary = %group_primary,
+        group_primary_hash = %group_primary_hash,
+        content_path = if primary.content_path.is_empty() { "<unavailable>" } else { primary.content_path.as_str() },
+        effective_create_time = primary.effective_create_time,
+        cross_seeds_found,
+        "selected torrent for cross-seed-aware deletion"
+    );
+
+    let mut unique_candidates_added = 0usize;
+    let mut unique_siblings_added = 0usize;
+
+    if let Some(group_members) = group_members {
+        for member in group_members {
+            let is_new = record_delete_candidate_with_metadata(
+                remove_by_hash,
+                member.clone(),
+                strategy_name,
+                &group_primary,
+                &group_primary_hash,
+                cross_seeds_found,
+            );
+            if is_new {
+                unique_candidates_added += 1;
+            }
+            if member.hash != primary.hash && is_new {
+                unique_siblings_added += 1;
+                info!(
+                    task = %task_name,
+                    strategy = %strategy_name,
+                    torrent = %primary.name,
+                    hash = %primary.hash,
+                    sibling_torrent = %member.name,
+                    sibling_hash = %member.hash,
+                    "adding cross-seeded sibling to delete set"
+                );
+            }
+        }
+    } else {
+        let is_new = record_delete_candidate_with_metadata(
+            remove_by_hash,
+            primary,
+            strategy_name,
+            &group_primary,
+            &group_primary_hash,
+            0,
+        );
+        if is_new {
+            unique_candidates_added += 1;
+        }
+    }
+
+    DeleteGroupStats {
+        group_key,
+        cross_seeds_found,
+        unique_candidates_added,
+        unique_siblings_added,
+    }
 }
 
 fn load_config(config_path: &Path) -> Result<AutoremoveConfig> {
@@ -851,7 +1133,11 @@ fn apply_condition(
             compare(torrent.ratio, *limit, Comparer::Gt)
         }),
         ConditionSpec::CreateTime(limit) => partition_by(torrents, |torrent| {
-            compare((now - torrent.create_time) as f64, *limit, Comparer::Gt)
+            compare(
+                (now - torrent.effective_create_time) as f64,
+                *limit,
+                Comparer::Gt,
+            )
         }),
         ConditionSpec::DownloadingTime(limit) => partition_by(torrents, |torrent| {
             compare(torrent.downloading_time as f64, *limit, Comparer::Gt)
@@ -1059,10 +1345,9 @@ fn apply_free_space(
 
 fn sort_torrents(torrents: &mut [Torrent], action: SortAction) {
     match action {
-        SortAction::RemoveOldSeeds => torrents.sort_by_key(|torrent| torrent.create_time),
-        SortAction::RemoveNewSeeds => {
-            torrents.sort_by(|left, right| right.create_time.cmp(&left.create_time))
-        }
+        SortAction::RemoveOldSeeds => torrents.sort_by_key(|torrent| torrent.effective_create_time),
+        SortAction::RemoveNewSeeds => torrents
+            .sort_by(|left, right| right.effective_create_time.cmp(&left.effective_create_time)),
         SortAction::RemoveBigSeeds => torrents.sort_by(|left, right| right.size.cmp(&left.size)),
         SortAction::RemoveSmallSeeds => torrents.sort_by_key(|torrent| torrent.size),
         SortAction::RemoveActiveSeeds => {
@@ -1136,9 +1421,11 @@ fn matches_relation(
                 TorrentStatus::Downloading | TorrentStatus::Uploading
             ) && compare(torrent.connected_seeder as f64, *value, comparer)
         }
-        (Parameter::CreateTime, Literal::Number(value)) => {
-            compare((now - torrent.create_time) as f64, *value, comparer)
-        }
+        (Parameter::CreateTime, Literal::Number(value)) => compare(
+            (now - torrent.effective_create_time) as f64,
+            *value,
+            comparer,
+        ),
         (Parameter::Download, Literal::Number(value)) => {
             compare(torrent.downloaded as f64, gib_to_bytes(*value), comparer)
         }
@@ -1634,6 +1921,7 @@ impl QbitAutoremoveClient {
             torrents.push(Torrent {
                 hash: torrent.hash,
                 name: torrent.name,
+                content_path: torrent.content_path,
                 category,
                 tracker: trackers.into_iter().map(|tracker| tracker.url).collect(),
                 status: map_qbit_status(&torrent.state),
@@ -1643,6 +1931,7 @@ impl QbitAutoremoveClient {
                 uploaded: properties.total_uploaded,
                 downloaded: properties.total_downloaded,
                 create_time: properties.addition_date,
+                effective_create_time: properties.addition_date,
                 seeding_time: properties.seeding_time,
                 downloading_time: properties.downloading_time,
                 upload_speed: properties.up_speed,
@@ -1786,6 +2075,8 @@ struct QbitTorrentSummary {
     hash: String,
     name: String,
     #[serde(default)]
+    content_path: String,
+    #[serde(default)]
     category: String,
     #[serde(default)]
     state: String,
@@ -1849,6 +2140,7 @@ mod tests {
         Torrent {
             hash: format!("hash-{name}"),
             name: name.to_string(),
+            content_path: String::new(),
             category: vec![],
             tracker: vec![],
             status: TorrentStatus::Uploading,
@@ -1858,6 +2150,7 @@ mod tests {
             uploaded: 100,
             downloaded: 100,
             create_time: 100,
+            effective_create_time: 100,
             seeding_time: 100,
             downloading_time: 100,
             upload_speed: 100,
@@ -1952,10 +2245,12 @@ name = "cleanup"
         sample.ratio = 2.0;
         sample.seeding_time = 10;
         sample.create_time = 900;
+        sample.effective_create_time = 900;
 
         assert!(!matches_expression(&expression, &sample, now));
 
         sample.create_time = 100;
+        sample.effective_create_time = 100;
         assert!(matches_expression(&expression, &sample, now));
     }
 
@@ -2003,6 +2298,7 @@ name = "cleanup"
         let expression = parse_expression("create_time > 1000").expect("expression parses");
         let mut sample = torrent("sample");
         sample.create_time = -1;
+        sample.effective_create_time = -1;
 
         assert!(matches_expression(&expression, &sample, 1_000));
     }
@@ -2011,8 +2307,10 @@ name = "cleanup"
     fn remove_old_seeds_sorts_negative_create_time_first() {
         let mut unknown = torrent("unknown");
         unknown.create_time = -1;
+        unknown.effective_create_time = -1;
         let mut known = torrent("known");
         known.create_time = 10;
+        known.effective_create_time = 10;
 
         let (_remain, remove) = apply_maximum_number(
             vec![known.clone(), unknown.clone()],
@@ -2050,10 +2348,13 @@ name = "cleanup"
     fn maximum_number_remove_old_seeds_removes_oldest_first() {
         let mut oldest = torrent("oldest");
         oldest.create_time = 10;
+        oldest.effective_create_time = 10;
         let mut middle = torrent("middle");
         middle.create_time = 20;
+        middle.effective_create_time = 20;
         let mut newest = torrent("newest");
         newest.create_time = 30;
+        newest.effective_create_time = 30;
 
         let (remain, remove) = apply_maximum_number(
             vec![middle.clone(), newest.clone(), oldest.clone()],
@@ -2120,5 +2421,165 @@ name = "cleanup"
         assert_eq!(remove_by_hash.len(), 1);
         assert_eq!(candidate.torrent.name, "sample");
         assert_eq!(candidate.strategy, "first");
+        assert_eq!(candidate.group_primary, "sample");
+        assert_eq!(candidate.group_primary_hash, "hash-sample");
+        assert_eq!(candidate.cross_seeds_found, 0);
+    }
+
+    #[test]
+    fn effective_create_time_uses_earliest_member_in_group() {
+        let mut early = torrent("early");
+        early.create_time = 100;
+        early.effective_create_time = 100;
+        early.content_path = "/downloads/shared/./".to_string();
+        let mut late = torrent("late");
+        late.create_time = 200;
+        late.effective_create_time = 200;
+        late.content_path = "/downloads/shared".to_string();
+        let mut solo = torrent("solo");
+        solo.create_time = 300;
+        solo.effective_create_time = 300;
+
+        let mut torrents = vec![late, solo, early];
+        apply_effective_group_create_times(&mut torrents);
+
+        let by_hash = torrents
+            .into_iter()
+            .map(|torrent| (torrent.hash.clone(), torrent))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_hash["hash-early"].effective_create_time, 100);
+        assert_eq!(by_hash["hash-late"].effective_create_time, 100);
+        assert_eq!(by_hash["hash-solo"].effective_create_time, 300);
+    }
+
+    #[test]
+    fn create_time_condition_uses_earliest_member_in_group() {
+        let mut early = torrent("early");
+        early.create_time = 100;
+        early.effective_create_time = 100;
+        early.content_path = "/downloads/shared".to_string();
+        let mut late = torrent("late");
+        late.create_time = 200;
+        late.effective_create_time = 200;
+        late.content_path = "/downloads/shared".to_string();
+
+        let mut torrents = vec![early, late];
+        apply_effective_group_create_times(&mut torrents);
+
+        let late = torrents
+            .into_iter()
+            .find(|torrent| torrent.hash == "hash-late")
+            .expect("late torrent exists");
+        let (_remain, remove) = apply_condition(
+            &ConditionSpec::CreateTime(850.0),
+            &ClientStatus::default(),
+            vec![late],
+            1_000,
+        )
+        .expect("condition applies");
+
+        assert_eq!(remove.len(), 1);
+        assert_eq!(remove[0].hash, "hash-late");
+    }
+
+    #[test]
+    fn delete_group_candidates_expand_shared_content_path_group() {
+        let mut primary = torrent("primary");
+        primary.content_path = "/downloads/shared".to_string();
+        let mut sibling = torrent("sibling");
+        sibling.content_path = "/downloads/shared/./".to_string();
+        let torrents = vec![primary.clone(), sibling.clone()];
+        let (group_members_by_key, group_key_by_hash) = build_group_lookups(&torrents);
+
+        let mut remove_by_hash = HashMap::new();
+        let first = record_delete_group_candidates(
+            &mut remove_by_hash,
+            &group_members_by_key,
+            &group_key_by_hash,
+            primary.clone(),
+            "first",
+            "task",
+        );
+        let second = record_delete_group_candidates(
+            &mut remove_by_hash,
+            &group_members_by_key,
+            &group_key_by_hash,
+            sibling,
+            "second",
+            "task",
+        );
+
+        assert_eq!(remove_by_hash.len(), 2);
+        assert_eq!(first.cross_seeds_found, 1);
+        assert_eq!(first.unique_candidates_added, 2);
+        assert_eq!(first.unique_siblings_added, 1);
+        assert_eq!(second.cross_seeds_found, 1);
+        assert_eq!(second.unique_candidates_added, 0);
+        assert_eq!(second.unique_siblings_added, 0);
+        assert_eq!(remove_by_hash["hash-primary"].strategy, "first");
+        assert_eq!(remove_by_hash["hash-sibling"].strategy, "first");
+        assert_eq!(remove_by_hash["hash-primary"].group_primary, "primary");
+        assert_eq!(
+            remove_by_hash["hash-primary"].group_primary_hash,
+            "hash-primary"
+        );
+        assert_eq!(remove_by_hash["hash-primary"].cross_seeds_found, 1);
+        assert_eq!(remove_by_hash["hash-sibling"].group_primary, "primary");
+        assert_eq!(
+            remove_by_hash["hash-sibling"].group_primary_hash,
+            "hash-primary"
+        );
+        assert_eq!(remove_by_hash["hash-sibling"].cross_seeds_found, 1);
+    }
+
+    #[test]
+    fn filtered_cross_seed_groups_are_deduped_across_strategy_lists() {
+        let mut primary = torrent("primary");
+        primary.content_path = "/downloads/shared".to_string();
+        let mut sibling = torrent("sibling");
+        sibling.content_path = "/downloads/shared/./".to_string();
+        let torrents = vec![primary.clone(), sibling.clone()];
+        let (group_members_by_key, group_key_by_hash) = build_group_lookups(&torrents);
+        let mut filtered_cross_seed_groups = HashSet::new();
+
+        extend_filtered_cross_seed_groups(
+            &[primary],
+            &group_members_by_key,
+            &group_key_by_hash,
+            &mut filtered_cross_seed_groups,
+        );
+        extend_filtered_cross_seed_groups(
+            &[sibling],
+            &group_members_by_key,
+            &group_key_by_hash,
+            &mut filtered_cross_seed_groups,
+        );
+
+        let (groups, siblings) =
+            summarize_cross_seed_groups(&filtered_cross_seed_groups, &group_members_by_key);
+
+        assert_eq!(groups, 1);
+        assert_eq!(siblings, 1);
+    }
+
+    #[test]
+    fn standalone_filtered_torrents_do_not_count_as_cross_seeds() {
+        let standalone = torrent("standalone");
+        let torrents = vec![standalone.clone()];
+        let (group_members_by_key, group_key_by_hash) = build_group_lookups(&torrents);
+        let mut filtered_cross_seed_groups = HashSet::new();
+
+        extend_filtered_cross_seed_groups(
+            &[standalone],
+            &group_members_by_key,
+            &group_key_by_hash,
+            &mut filtered_cross_seed_groups,
+        );
+
+        let (groups, siblings) =
+            summarize_cross_seed_groups(&filtered_cross_seed_groups, &group_members_by_key);
+
+        assert_eq!(groups, 0);
+        assert_eq!(siblings, 0);
     }
 }
