@@ -1195,7 +1195,7 @@ impl QbitClient {
             );
         }
 
-        if body.trim() != "Ok." {
+        if !is_successful_login_body(&body) {
             bail!("qBittorrent login failed: {}", body.trim());
         }
 
@@ -1334,6 +1334,11 @@ fn api_url(base_url: &Url, endpoint: &str) -> Result<Url> {
         .with_context(|| format!("failed to build API URL for endpoint {endpoint}"))
 }
 
+fn is_successful_login_body(body: &str) -> bool {
+    let body = body.trim();
+    body.is_empty() || body == "Ok."
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1383,6 +1388,23 @@ mod tests {
             auto_tmm: false,
             state: String::new(),
         }
+    }
+
+    #[test]
+    fn accepts_classic_qbittorrent_login_body() {
+        assert!(is_successful_login_body("Ok."));
+        assert!(is_successful_login_body(" Ok.\n"));
+    }
+
+    #[test]
+    fn accepts_empty_qbittorrent_login_body() {
+        assert!(is_successful_login_body(""));
+        assert!(is_successful_login_body("\n"));
+    }
+
+    #[test]
+    fn rejects_failed_qbittorrent_login_body() {
+        assert!(!is_successful_login_body("Fails."));
     }
 
     #[test]

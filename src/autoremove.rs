@@ -15,7 +15,8 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     ClientConfig, ContentGroupKey, api_url, build_origin, current_unix_timestamp, filesystem_usage,
-    group_by_content_path, load_logging_mode, normalize_base_url, setup_logging_with_level,
+    group_by_content_path, is_successful_login_body, load_logging_mode, normalize_base_url,
+    setup_logging_with_level,
 };
 
 const BYTES_PER_GIB: f64 = 1_073_741_824.0;
@@ -1875,7 +1876,7 @@ impl QbitAutoremoveClient {
                 body.trim()
             );
         }
-        if body.trim() != "Ok." {
+        if !is_successful_login_body(&body) {
             bail!("qBittorrent login failed: {}", body.trim());
         }
 
