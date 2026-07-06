@@ -26,6 +26,8 @@ pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = DEFAULT_AUTOREMOVE_INTERVAL_SECS;
 
 const SECONDS_PER_DAY: u64 = 86_400;
 const MOVE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const LOW_SPACE_FILESYSTEM_STAT_ATTEMPTS: u32 = 12;
+const LOW_SPACE_FILESYSTEM_STAT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -366,7 +368,7 @@ pub fn run_move_on_low_space_daemon(
         info!(cycle, "starting move-on-low-space daemon cycle");
 
         if let Err(error) = run_move_on_low_space_once(&config.client, &rules, dry_run) {
-            error!(cycle, error = %error, "move-on-low-space daemon cycle failed");
+            error!(cycle, error = %format!("{error:#}"), "move-on-low-space daemon cycle failed");
         }
 
         info!(
@@ -448,7 +450,7 @@ fn process_low_space_rule(
     let mut triggered = false;
 
     loop {
-        let usage = filesystem_usage(&rule.source_path)?;
+        let usage = filesystem_usage_for_low_space(&rule.source_path)?;
         let free_percent = free_space_percent(usage);
         info!(
             source = %rule.source_path.display(),
@@ -773,6 +775,34 @@ fn filesystem_usage(path: &Path) -> Result<FilesystemUsage> {
         total_bytes: total_blocks.saturating_mul(block_size),
         available_bytes: available_blocks.saturating_mul(block_size),
     })
+}
+
+fn filesystem_usage_for_low_space(path: &Path) -> Result<FilesystemUsage> {
+    let mut last_error = None;
+
+    for attempt in 1..=LOW_SPACE_FILESYSTEM_STAT_ATTEMPTS {
+        match filesystem_usage(path) {
+            Ok(usage) => return Ok(usage),
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    attempt,
+                    attempts = LOW_SPACE_FILESYSTEM_STAT_ATTEMPTS,
+                    error = %format!("{error:#}"),
+                    "failed to read filesystem statistics for low-space rule"
+                );
+                last_error = Some(error);
+
+                if attempt < LOW_SPACE_FILESYSTEM_STAT_ATTEMPTS {
+                    sleep(LOW_SPACE_FILESYSTEM_STAT_RETRY_INTERVAL);
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect(
+        "low-space filesystem stat attempts should record an error",
+    ))
 }
 
 fn free_space_percent(usage: FilesystemUsage) -> f64 {
