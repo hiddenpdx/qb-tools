@@ -1,6 +1,23 @@
 #!/bin/sh
 set -eu
 
+PUID="${PUID:-1000}"
+PGID="${PGID:-1000}"
+
+case "$PUID" in
+    ''|*[!0-9]*)
+        echo "PUID must be a numeric user id" >&2
+        exit 64
+        ;;
+esac
+
+case "$PGID" in
+    ''|*[!0-9]*)
+        echo "PGID must be a numeric group id" >&2
+        exit 64
+        ;;
+esac
+
 need_daemon=1
 need_config=1
 
@@ -23,4 +40,4 @@ if [ "$need_daemon" -eq 1 ]; then
     set -- --daemon "$@"
 fi
 
-exec /usr/local/bin/app "$@"
+exec su-exec "$PUID:$PGID" /usr/local/bin/app "$@"

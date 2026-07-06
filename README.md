@@ -91,8 +91,26 @@ Release builds also publish multi-arch Docker images for the Linux binaries. Car
   - `latest` only for non-prerelease tags
 - Prerelease tags skip both the Docker build phase and Docker publish phase
 - Container default command: `--daemon --config /config/config.toml`
+- Containers run the app as `PUID:PGID`, defaulting to `1000:1000`
 
 The Docker jobs are wired into Cargo Dist via `local-artifacts-jobs` and `publish-jobs`, so updating dist-managed CI should be done with `dist generate --mode ci`.
+
+Example Docker Compose service configuration:
+
+```yaml
+services:
+  qb-move-on-low-space:
+    image: hiddenpdx/qb-move-on-low-space:latest
+    environment:
+      PUID: "1000"
+      PGID: "1001"
+    volumes:
+      - ./config:/config:ro
+      - /downloads:/downloads
+      - /storage:/storage
+```
+
+Do not set a Compose `user:` override for these images; the entrypoint drops privileges to `PUID:PGID` before starting the app. The image does not change ownership of mounted volumes.
 
 ## Config
 
